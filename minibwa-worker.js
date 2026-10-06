@@ -58,15 +58,79 @@ function flushOutput() {
 	}
 }
 
+function append(type, text) {
+	buffers[type] += text;
+	if (buffers[type].length >= BATCH_BYTES) flushOutput();
+	else if (batchTimer === null) batchTimer = setTimeout(flushOutput, BATCH_MS);
+}
+
 function emit(type, line) {
 	lastOutputMs = Date.now();
 	if (type === 'stderr') {
 		if (line.includes('[M::main]') && line.includes('Real time:')) sawMainDone = true;
 		else if (line.startsWith('ERROR') || line.startsWith('[E::')) sawError = true;
 	}
-	buffers[type] += `${line}\n`;
-	if (buffers[type].length >= BATCH_BYTES) flushOutput();
-	else if (batchTimer === null) batchTimer = setTimeout(flushOutput, BATCH_MS);
+	append(type, `${line}\n`);
+}
+
+/**
+ * Emits `text`, which is whole lines (it ends with a newline), cut into batches at line
+ * boundaries. One write by the mapper can hold megabytes; the page is fed it in small pieces,
+ * as it always was, so that it can skip ahead between them.
+ */
+function emitLines(type, text) {
+	lastOutputMs = Date.now();
+	let start = 0;
+	while (text.length - start > BATCH_BYTES) {
+		const cut = text.indexOf('\n', start + BATCH_BYTES);
+		if (cut < 0) break;
+		append(type, text.slice(start, cut + 1));
+		start = cut + 1;
+	}
+	if (start < text.length) append(type, start === 0 ? text : text.slice(start));
+}
+
+/*
+ * The mapper's SAM output. Through stdout every byte goes one at a time through JavaScript
+ * (Emscripten's terminal device), on the one thread that writes the output, which caps how
+ * fast the mapper can run however many threads it has. A device of our own is handed each
+ * write as one buffer instead. `minibwa map -o` opens it like a file.
+ */
+const OUTPUT_DEVICE = '/dev/minibwa-out';
+const outputDecoder = new TextDecoder();
+/** The unfinished last line of what has been written so far. */
+let partialLine = '';
+let hasOutputDevice = false;
+
+function writeOutput(bytes) {
+	const text = partialLine + outputDecoder.decode(bytes, { stream: true });
+	const end = text.lastIndexOf('\n') + 1;
+	partialLine = text.slice(end);
+	if (end > 0) emitLines('stdout', end === text.length ? text : text.slice(0, end));
+}
+
+function closeOutput() {
+	partialLine += outputDecoder.decode();
+	if (partialLine) emit('stdout', partialLine);
+	partialLine = '';
+}
+
+function registerOutputDevice(FS) {
+	const device = FS.makedev(64, 0);
+	FS.registerDevice(device, {
+		open(stream) {
+			stream.seekable = false;
+		},
+		close: closeOutput,
+		// The buffer is the whole (shared) heap; a view of shared memory cannot be decoded,
+		// so the bytes are copied out first.
+		write(stream, buffer, offset, length) {
+			if (length > 0) writeOutput(buffer.slice(offset, offset + length));
+			return length;
+		}
+	});
+	FS.mkdev(OUTPUT_DEVICE, device);
+	hasOutputDevice = true;
 }
 
 let runtime = null;
@@ -112,6 +176,12 @@ const handlers = {
 				printErr: (text) => emit('stderr', String(text)),
 				onRuntimeInitialized: () => {
 					runtime = self.Module;
+					try {
+						registerOutputDevice(runtime.FS);
+					} catch (error) {
+						// Output then goes through stdout, which is slower but works.
+						emit('stderr', `Could not set up the bulk output device: ${error}`);
+					}
 					resolve({ crossOriginIsolated: self.crossOriginIsolated === true });
 				}
 			};
@@ -145,12 +215,19 @@ const handlers = {
 		FS.mount(WORKERFS, { blobs: files.map(({ name, file }) => ({ name, data: file })) }, dir);
 	},
 
-	async run({ args, drain }) {
+	/**
+	 * Runs a command. With `bulkOutput`, `args` is a `minibwa map` command and its output goes
+	 * to the bulk output device (see OUTPUT_DEVICE) instead of stdout, if there is one.
+	 */
+	async run({ args, drain, bulkOutput }) {
 		const { callMain } = requireRuntime();
 		sawMainDone = false;
 		sawError = false;
 		lastOutputMs = Date.now();
-		const code = callMain(args);
+		partialLine = '';
+		const code = callMain(
+			bulkOutput && hasOutputDevice ? [args[0], '-o', OUTPUT_DEVICE, ...args.slice(1)] : args
+		);
 		if (drain) await drainOutput();
 		if (code && code !== 0) throw new Error(`minibwa exited with code ${code}`);
 	}
